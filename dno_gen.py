@@ -10,8 +10,12 @@ from datetime import datetime, timezone
 import subprocess
 import os
 import argparse
+from dotenv import load_dotenv
 
-API_TOKEN = 'hUacbPaHaf7wA8DTwEpcO0Fd4EeIsuPI'
+# Load environment variables from .env file
+load_dotenv()
+
+API_TOKEN = os.environ.get('API_TOKEN')
 API_BASE_URL = 'https://api-dev.ringer.tel/v1/telique/lerg/lerg_6/npa,nxx,block_id'
 
 # Enable debug logging with environment variable
