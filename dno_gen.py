@@ -619,7 +619,52 @@ def send_success_email(stats):
     runtime = stats.get('runtime', 0)
     runtime_str = f"{runtime/60:.1f} minutes" if runtime > 60 else f"{runtime:.0f} seconds"
     
-    subject = f"✅ DNO Generation Completed - {stats.get('total_assigned', 0):,} Assigned"
+    # Customize subject based on upload status
+    if stats.get('upload_requested', False):
+        if stats.get('upload_success', False):
+            subject = f"✅ DNO Generation Completed & Uploaded - {stats.get('total_assigned', 0):,} Assigned"
+        elif stats.get('upload_attempted', False) and not stats.get('upload_success', False):
+            subject = f"⚠️ DNO Generation Completed (Upload Failed) - {stats.get('total_assigned', 0):,} Assigned"
+        elif stats.get('upload_cancelled', False):
+            subject = f"✅ DNO Generation Completed (Upload Skipped) - {stats.get('total_assigned', 0):,} Assigned"
+        else:
+            subject = f"✅ DNO Generation Completed - {stats.get('total_assigned', 0):,} Assigned"
+    else:
+        subject = f"✅ DNO Generation Completed - {stats.get('total_assigned', 0):,} Assigned"
+    
+    # Determine upload status message
+    upload_section = ""
+    if stats.get('upload_requested', False):
+        if stats.get('upload_cancelled', False):
+            upload_section = """
+    <h3>Upload Status</h3>
+    <ul>
+        <li>⚠️ <b>Upload cancelled by user</b></li>
+    </ul>
+    """
+        elif stats.get('upload_success', False):
+            upload_section = """
+    <h3>Upload Status</h3>
+    <ul>
+        <li>✅ <b>Successfully uploaded to DNO API</b></li>
+        <li>File: unassigned_npa_nxx_x.csv</li>
+    </ul>
+    """
+        elif stats.get('upload_attempted', False):
+            upload_section = """
+    <h3>Upload Status</h3>
+    <ul>
+        <li>❌ <b>Failed to upload to DNO API</b></li>
+        <li>Manual upload may be required</li>
+    </ul>
+    """
+        else:
+            upload_section = """
+    <h3>Upload Status</h3>
+    <ul>
+        <li>⚠️ <b>Upload was requested but not attempted</b></li>
+    </ul>
+    """
     
     html_content = f"""
     <h2>DNO Generation Completed Successfully</h2>
@@ -648,6 +693,8 @@ def send_success_email(stats):
         <li>a_block_analysis.csv</li>
         <li>lerg_summary.csv</li>
     </ul>
+    
+    {upload_section}
     
     <p><small>Generated at {datetime.now(timezone.utc).isoformat()}</small></p>
     """
@@ -992,7 +1039,37 @@ def main(args=None):
     if 'itg_data' in locals():
         print(f"ITG Traceback Records:            {len(itg_data):,}")
     
-    # Send success email
+    # Handle automatic upload if requested
+    upload_attempted = False
+    upload_success = False
+    upload_cancelled = False
+    
+    if args and args.upload:
+        unassigned_file = 'unassigned_npa_nxx_x.csv'
+        print("\n" + "="*50)
+        print("UPLOAD TO API")
+        print("="*50)
+        
+        if not args.yes:
+            print(f"\nReady to upload {unassigned_file} to the DNO API.")
+            confirmation = input("Proceed with upload? (y/N): ").strip().lower()
+            if confirmation not in ['y', 'yes']:
+                print("Upload cancelled.")
+                upload_cancelled = True
+            else:
+                upload_attempted = True
+        else:
+            upload_attempted = True
+        
+        if upload_attempted:
+            upload_success = upload_to_api(unassigned_file)
+            
+            if upload_success:
+                print("\n✓ Data successfully uploaded to DNO API")
+            else:
+                print("\n✗ Failed to upload data to DNO API")
+    
+    # Send success email with upload status
     success_stats = {
         'runtime': time.time() - start_time,
         'npas_processed': len(all_npas),
@@ -1005,31 +1082,17 @@ def main(args=None):
         'unassigned_percent': (len(unassigned)/len(all_possible)*100),
         'condensed_unassigned': len(condensed_unassigned),
         'itg_records': len(itg_data) if 'itg_data' in locals() else 0,
-        'total_output_records': valid_records if 'valid_records' in locals() else len(condensed_unassigned)
+        'total_output_records': valid_records if 'valid_records' in locals() else len(condensed_unassigned),
+        'upload_requested': args.upload if args else False,
+        'upload_attempted': upload_attempted,
+        'upload_success': upload_success,
+        'upload_cancelled': upload_cancelled
     }
     send_success_email(success_stats)
     
-    # Handle automatic upload if requested
-    if args and args.upload:
-        unassigned_file = 'unassigned_npa_nxx_x.csv'
-        print("\n" + "="*50)
-        print("UPLOAD TO API")
-        print("="*50)
-        
-        if not args.yes:
-            print(f"\nReady to upload {unassigned_file} to the DNO API.")
-            confirmation = input("Proceed with upload? (y/N): ").strip().lower()
-            if confirmation not in ['y', 'yes']:
-                print("Upload cancelled.")
-                return
-        
-        upload_success = upload_to_api(unassigned_file)
-        
-        if upload_success:
-            print("\n✓ Data successfully uploaded to DNO API")
-        else:
-            print("\n✗ Failed to upload data to DNO API")
-            sys.exit(1)
+    # Exit with error if upload was requested but failed
+    if upload_attempted and not upload_success:
+        sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate DNO (Do Not Originate) data from LERG and ITG sources')
