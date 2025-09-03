@@ -179,8 +179,9 @@ def fetch_nxx_combinations_for_npa(npa):
             response_data = make_api_request_with_retry(url, headers={'x-api-token': API_TOKEN})
             
             if response_data is None:
-                print(f"\n  ERROR: Failed to fetch data for NPA {npa} at offset {offset}", file=sys.stderr)
-                break
+                error_msg = f"Failed to fetch NXX data for NPA {npa} at offset {offset} - API request failed after {MAX_RETRIES} attempts"
+                print(f"\n  ERROR: {error_msg}", file=sys.stderr)
+                raise Exception(error_msg)
             
             data = response_data.get('data', [])
             
@@ -235,8 +236,9 @@ def fetch_blocks_for_npa_nxx(npa, nxx):
             response_data = make_api_request_with_retry(url, headers={'x-api-token': API_TOKEN})
             
             if response_data is None:
-                print(f"\n  ERROR: Failed to fetch blocks for NPA {npa}-NXX {nxx} at offset {offset}", file=sys.stderr)
-                break
+                error_msg = f"Failed to fetch blocks for NPA {npa}-NXX {nxx} at offset {offset} - API request failed after {MAX_RETRIES} attempts"
+                print(f"\n  ERROR: {error_msg}", file=sys.stderr)
+                raise Exception(error_msg)
             
             data = response_data.get('data', [])
             
@@ -282,8 +284,9 @@ def fetch_assigned_for_npa_bulk(npa):
         response_data = make_api_request_with_retry(url, headers={'x-api-token': API_TOKEN})
         
         if response_data is None:
-            print(f"\n  ERROR: Failed to fetch page {page} for NPA {npa}", file=sys.stderr)
-            break
+            error_msg = f"Failed to fetch page {page} for NPA {npa} - API request failed after {MAX_RETRIES} attempts"
+            print(f"\n  ERROR: {error_msg}", file=sys.stderr)
+            raise Exception(error_msg)
         
         data = response_data.get('data', [])
         
@@ -670,8 +673,10 @@ def main(args=None):
             
         except Exception as e:
             print(f"\nERROR: Failed to process NPA {npa}: {e}", file=sys.stderr)
-            print(f"Continuing with next NPA...", file=sys.stderr)
-            continue
+            print(f"Data integrity cannot be guaranteed with missing NPAs.", file=sys.stderr)
+            print(f"Please fix the issue and re-run the script.", file=sys.stderr)
+            print(f"\nTo resume from NPA {npa}, you can modify the script to start from this NPA.", file=sys.stderr)
+            sys.exit(1)
     
     print(f"\n\nTotal assigned NPA-NXX-X combinations found: {len(all_assigned)}")
     
