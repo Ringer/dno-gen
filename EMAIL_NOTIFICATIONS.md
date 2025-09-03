@@ -43,12 +43,23 @@ DNO_EMAIL_NOTIFICATIONS=false
 
 ## Email Content
 
-### Success Email
+### Success Email Subject Lines
+- **No upload**: `✅ DNO Generation Completed - X,XXX,XXX Assigned`
+- **Successful upload**: `✅ DNO Generation Completed & Uploaded - X,XXX,XXX Assigned`
+- **Failed upload**: `⚠️ DNO Generation Completed (Upload Failed) - X,XXX,XXX Assigned`
+- **Cancelled upload**: `✅ DNO Generation Completed (Upload Skipped) - X,XXX,XXX Assigned`
+
+### Success Email Body
 - Runtime and performance metrics
 - Total NPAs processed
 - Number of assigned/unassigned combinations
 - ITG traceback records count
 - List of generated files
+- **Upload status** (if --upload flag used):
+  - ✅ Successfully uploaded to DNO API
+  - ❌ Failed to upload (manual upload required)
+  - ⚠️ Upload cancelled by user
+  - No upload section if not requested
 
 ### Failure Email
 - Which NPA failed
