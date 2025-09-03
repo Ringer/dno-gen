@@ -18,7 +18,7 @@ import socket
 load_dotenv()
 
 API_TOKEN = os.environ.get('API_TOKEN')
-API_BASE_URL = 'https://api-dev.ringer.tel/v1/telique/lerg/lerg_6/npa,nxx,block_id'
+API_BASE_URL = 'https://api-dev.ringer.tel/v1/telique/lerg/lerg_6'
 
 # Enable debug logging with environment variable
 DEBUG_MODE = os.environ.get('DNO_DEBUG', '').lower() in ('true', '1', 'yes')
@@ -35,6 +35,10 @@ REQUEST_TIMEOUT = 45  # increased from 30
 API_CALL_DELAY = 0.01  # Minimal delay between API calls (10ms) when enabled
 BATCH_DELAY = 0.1  # Small delay after batch of requests (100ms) when enabled
 BATCH_SIZE = 100  # Larger batch size since API is fast
+
+# Bulk fetch configuration
+MAX_LIMIT_PER_REQUEST = 10000  # Maximum records per API request (API limit)
+USE_BULK_FETCH = os.environ.get('DNO_BULK_FETCH', 'true').lower() in ('true', '1', 'yes')
 
 # Global request counter for rate limiting
 request_counter = 0
@@ -259,8 +263,86 @@ def fetch_blocks_for_npa_nxx(npa, nxx):
     
     return blocks
 
-def fetch_assigned_for_npa(npa):
-    """Fetch all assigned NPA-NXX-block_id combinations for a given NPA using two-step approach"""
+def fetch_assigned_for_npa_bulk(npa):
+    """
+    Optimized: Fetch ALL npa,nxx,block_id combinations for a given NPA in bulk.
+    Uses pagination with maximum limit to minimize API calls.
+    """
+    all_records = []
+    offset = 0
+    page = 1
+    
+    if DEBUG_MODE:
+        print(f"  DEBUG: NPA {npa} - Using BULK fetch (limit={MAX_LIMIT_PER_REQUEST})")
+    
+    while True:
+        # Direct query for all npa,nxx,block_id combinations
+        url = f"{API_BASE_URL}/npa,nxx,block_id/npa={npa}?limit={MAX_LIMIT_PER_REQUEST}&offset={offset}"
+        
+        response_data = make_api_request_with_retry(url, headers={'x-api-token': API_TOKEN})
+        
+        if response_data is None:
+            print(f"\n  ERROR: Failed to fetch page {page} for NPA {npa}", file=sys.stderr)
+            break
+        
+        data = response_data.get('data', [])
+        
+        if DEBUG_MODE and page == 1:
+            total_unique = response_data.get('total_unique', 'N/A')
+            print(f"  DEBUG: NPA {npa} - Total unique records: {total_unique}")
+        
+        if not data:
+            break
+        
+        all_records.extend(data)
+        
+        if DEBUG_MODE:
+            print(f"  DEBUG: NPA {npa} - Page {page}: Fetched {len(data)} records (total: {len(all_records)})")
+        
+        if len(data) < MAX_LIMIT_PER_REQUEST:
+            break
+        
+        offset += MAX_LIMIT_PER_REQUEST
+        page += 1
+    
+    # Process records to build assigned combinations
+    npa_nxx_blocks = {}
+    assigned = []
+    
+    for record in all_records:
+        npa_val = str(record.get('npa', '')).zfill(3)
+        nxx_val = str(record.get('nxx', '')).zfill(3)
+        block_id = str(record.get('block_id', ''))
+        
+        if npa_val and nxx_val and block_id:
+            key = f"{npa_val}-{nxx_val}"
+            
+            if key not in npa_nxx_blocks:
+                npa_nxx_blocks[key] = {'numeric': set(), 'has_a': False}
+            
+            if block_id == 'A':
+                npa_nxx_blocks[key]['has_a'] = True
+            else:
+                npa_nxx_blocks[key]['numeric'].add(block_id)
+    
+    # Handle A-block logic
+    for npa_nxx_key, block_info in npa_nxx_blocks.items():
+        if block_info['has_a'] and len(block_info['numeric']) == 0:
+            # A-only: all blocks 0-9 are assigned
+            for i in range(10):
+                assigned.append(f"{npa_nxx_key}-{i}")
+        else:
+            # Add only the numeric blocks
+            for block in block_info['numeric']:
+                assigned.append(f"{npa_nxx_key}-{block}")
+    
+    if DEBUG_MODE:
+        print(f"  DEBUG: NPA {npa} - API calls: {page}, Records: {len(all_records)}, Assigned: {len(assigned)}")
+    
+    return set(assigned), npa_nxx_blocks
+
+def fetch_assigned_for_npa_legacy(npa):
+    """Legacy: Fetch all assigned NPA-NXX-block_id combinations using two-step approach"""
     assigned = []
     
     # Step 1: Get all NXX combinations for this NPA
@@ -313,6 +395,13 @@ def fetch_assigned_for_npa(npa):
     
     # Convert to set to ensure uniqueness before returning
     return set(assigned), npa_nxx_blocks
+
+def fetch_assigned_for_npa(npa):
+    """Wrapper function for backwards compatibility - uses bulk fetch by default"""
+    if USE_BULK_FETCH:
+        return fetch_assigned_for_npa_bulk(npa)
+    else:
+        return fetch_assigned_for_npa_legacy(npa)
 
 def fetch_itg_traceback_data():
     """
@@ -514,8 +603,15 @@ def main(args=None):
         print("DEBUG MODE ENABLED (set DNO_DEBUG=false to disable)")
         print("=" * 50)
     
-    # Show rate limiting status
+    # Show configuration status
     rate_limit_enabled = os.environ.get('DNO_RATE_LIMIT', '').lower() in ('true', '1', 'yes')
+    if USE_BULK_FETCH:
+        print(f"Fetch mode: BULK (optimized, {MAX_LIMIT_PER_REQUEST} records/request)")
+        print(f"Expected time: ~2-3 minutes for all NPAs")
+    else:
+        print("Fetch mode: LEGACY (two-step approach)")
+        print("Expected time: ~8-10 hours for all NPAs")
+    
     if rate_limit_enabled:
         print("Rate limiting: ENABLED (set DNO_RATE_LIMIT=false to disable)")
     elif DEBUG_MODE:
@@ -549,7 +645,11 @@ def main(args=None):
                 print(f"Processing NPA {npa} ({i}/{len(all_npas)})...", end='\r')
         
         try:
-            assigned_for_npa, npa_nxx_blocks = fetch_assigned_for_npa(npa)
+            # Use bulk fetch by default, or legacy if disabled
+            if USE_BULK_FETCH:
+                assigned_for_npa, npa_nxx_blocks = fetch_assigned_for_npa_bulk(npa)
+            else:
+                assigned_for_npa, npa_nxx_blocks = fetch_assigned_for_npa_legacy(npa)
             
             # Track progress
             size_before = len(all_assigned)
