@@ -11,6 +11,8 @@ import subprocess
 import os
 import argparse
 from dotenv import load_dotenv
+import random
+import socket
 
 # Load environment variables from .env file
 load_dotenv()
@@ -20,6 +22,23 @@ API_BASE_URL = 'https://api-dev.ringer.tel/v1/telique/lerg/lerg_6/npa,nxx,block_
 
 # Enable debug logging with environment variable
 DEBUG_MODE = os.environ.get('DNO_DEBUG', '').lower() in ('true', '1', 'yes')
+
+# API retry configuration
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 1.0  # seconds
+MAX_RETRY_DELAY = 30.0  # seconds
+REQUEST_TIMEOUT = 45  # increased from 30
+
+# Rate limiting configuration (DISABLED by default)
+# The API responds quickly (~60ms) and handles rapid requests well
+# To enable rate limiting, set environment variable: DNO_RATE_LIMIT=true
+API_CALL_DELAY = 0.01  # Minimal delay between API calls (10ms) when enabled
+BATCH_DELAY = 0.1  # Small delay after batch of requests (100ms) when enabled
+BATCH_SIZE = 100  # Larger batch size since API is fast
+
+# Global request counter for rate limiting
+request_counter = 0
+last_request_time = 0
 
 def generate_all_possible_npa():
     """Generate all possible NPA codes (N=2-9, X=0-9, X=0-9)"""
@@ -48,87 +67,236 @@ def generate_all_possible_npa_nxx_block():
                                 combinations.add(f"{npa}-{nxx}-{block}")
     return combinations
 
-def fetch_assigned_for_npa(npa):
-    """Fetch all assigned NPA-NXX-block_id combinations for a given NPA"""
-    assigned = []
+def apply_rate_limiting():
+    """Apply minimal rate limiting between API calls"""
+    global request_counter, last_request_time
+    
+    # Rate limiting is DISABLED by default - only enable if explicitly requested
+    # Set DNO_RATE_LIMIT=true to enable rate limiting if needed
+    if not os.environ.get('DNO_RATE_LIMIT', '').lower() in ('true', '1', 'yes'):
+        return  # Skip rate limiting by default
+    
+    current_time = time.time()
+    time_since_last = current_time - last_request_time
+    
+    # Apply minimum delay between requests (only if needed)
+    if time_since_last < API_CALL_DELAY:
+        sleep_time = API_CALL_DELAY - time_since_last
+        # Only log if delay is significant (> 50ms)
+        if DEBUG_MODE and sleep_time > 0.05:
+            print(f"    DEBUG: Rate limiting - sleeping {sleep_time:.3f}s")
+        time.sleep(sleep_time)
+    
+    request_counter += 1
+    
+    # Apply longer delay after batch of requests
+    if request_counter % BATCH_SIZE == 0:
+        if DEBUG_MODE:
+            print(f"    DEBUG: Batch pause - {BATCH_DELAY}s after {request_counter} requests")
+        time.sleep(BATCH_DELAY)
+    
+    last_request_time = time.time()
+
+def make_api_request_with_retry(url, headers=None):
+    """Make an API request with retry logic and exponential backoff"""
+    retry_delay = INITIAL_RETRY_DELAY
+    last_exception = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Apply rate limiting (only on first attempt to avoid excessive delays on retries)
+            if attempt == 0:
+                apply_rate_limiting()
+            
+            if DEBUG_MODE and attempt > 0:
+                print(f"    DEBUG: Retry attempt {attempt + 1}/{MAX_RETRIES} for URL: {url[:100]}...")
+            
+            req = urllib.request.Request(url)
+            if headers:
+                for key, value in headers.items():
+                    req.add_header(key, value)
+            
+            # Set socket timeout as well as urlopen timeout
+            socket.setdefaulttimeout(REQUEST_TIMEOUT)
+            
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
+                response_data = response.read().decode('utf-8')
+                return json.loads(response_data)
+                
+        except (urllib.error.URLError, socket.timeout, socket.error) as e:
+            last_exception = e
+            error_msg = str(e)
+            
+            # Check if it's a timeout
+            if 'timed out' in error_msg.lower() or isinstance(e, socket.timeout):
+                print(f"\n  WARNING: Request timeout (attempt {attempt + 1}/{MAX_RETRIES}): {url[:80]}...", file=sys.stderr)
+            # Check if it's a rate limit error (429)
+            elif hasattr(e, 'code') and e.code == 429:
+                print(f"\n  WARNING: Rate limited (attempt {attempt + 1}/{MAX_RETRIES}), backing off...", file=sys.stderr)
+                retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)  # Double the delay
+            else:
+                print(f"\n  WARNING: Request failed (attempt {attempt + 1}/{MAX_RETRIES}): {error_msg}", file=sys.stderr)
+            
+            if attempt < MAX_RETRIES - 1:
+                # Add jitter to prevent thundering herd
+                jittered_delay = retry_delay + random.uniform(0, retry_delay * 0.1)
+                print(f"  Retrying in {jittered_delay:.1f} seconds...", file=sys.stderr)
+                time.sleep(jittered_delay)
+                retry_delay = min(retry_delay * 1.5, MAX_RETRY_DELAY)  # Exponential backoff
+            else:
+                print(f"\n  ERROR: All {MAX_RETRIES} attempts failed for URL: {url[:100]}...", file=sys.stderr)
+                raise last_exception
+                
+        except json.JSONDecodeError as e:
+            print(f"\n  ERROR: Failed to parse JSON response: {e}", file=sys.stderr)
+            if attempt < MAX_RETRIES - 1:
+                print(f"  Retrying in {retry_delay:.1f} seconds...", file=sys.stderr)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, MAX_RETRY_DELAY)
+            else:
+                raise e
+    
+    return None
+
+def fetch_nxx_combinations_for_npa(npa):
+    """Fetch all NXX combinations for a given NPA (Step 1)"""
+    nxx_combinations = set()
     offset = 0
     limit = 1000
-    
-    # Track NPA-NXX combinations with their block types
-    npa_nxx_blocks = {}  # {npa-nxx: {'numeric': set(), 'has_a': bool}}
-    
-    # Track unique records to handle API duplicates
-    seen_records = set()
-    duplicate_count = 0
+    total_fetched = 0
     
     while True:
-        url = f"{API_BASE_URL}/npa={npa}?limit={limit}&offset={offset}"
+        url = f"https://api-dev.ringer.tel/v1/telique/lerg/lerg_6/npa,nxx/npa={npa}?limit={limit}&offset={offset}"
         
         try:
-            req = urllib.request.Request(url)
-            req.add_header('x-api-token', API_TOKEN)
+            if DEBUG_MODE:
+                print(f"  DEBUG: Fetching NXX for NPA {npa}, offset={offset}, limit={limit}")
             
-            with urllib.request.urlopen(req, timeout=30) as response:
-                response_data = json.loads(response.read().decode('utf-8'))
+            response_data = make_api_request_with_retry(url, headers={'x-api-token': API_TOKEN})
             
-            # Handle the wrapped API response
+            if response_data is None:
+                print(f"\n  ERROR: Failed to fetch data for NPA {npa} at offset {offset}", file=sys.stderr)
+                break
+            
             data = response_data.get('data', [])
             
             if DEBUG_MODE and offset == 0:
-                print(f"  DEBUG: NPA {npa} - First API response has {len(data)} records")
-                print(f"  DEBUG: NPA {npa} - Total unique: {response_data.get('total_unique', 'N/A')}")
+                print(f"  DEBUG: NPA {npa} - Step 1: Total unique NXX combinations: {response_data.get('total_unique', 'N/A')}")
             
             if not data or len(data) == 0:
+                if DEBUG_MODE:
+                    print(f"  DEBUG: No more data for NPA {npa} at offset {offset}")
                 break
                 
             for record in data:
                 npa_val = record.get('npa', '')
                 nxx_val = record.get('nxx', '')
-                block_id_val = str(record.get('block_id', ''))
                 
-                if npa_val and nxx_val and block_id_val:
-                    # Ensure NPA and NXX are always strings with proper padding
+                if npa_val and nxx_val:
                     npa_str = str(npa_val).zfill(3)
                     nxx_str = str(nxx_val).zfill(3)
-                    
-                    # Create unique record key for duplicate detection
-                    record_key = f"{npa_str}-{nxx_str}-{block_id_val}"
-                    if record_key in seen_records:
-                        duplicate_count += 1
-                        if DEBUG_MODE:
-                            print(f"  DEBUG: Duplicate record found: {record_key}")
-                        
-                        continue
-                    seen_records.add(record_key)
-                    
-                    npa_nxx_key = f"{npa_str}-{nxx_str}"
-                    
-                    # Initialize tracking for this NPA-NXX if needed
-                    if npa_nxx_key not in npa_nxx_blocks:
-                        npa_nxx_blocks[npa_nxx_key] = {'numeric': set(), 'has_a': False}
-                    
+                    nxx_combinations.add(f"{npa_str}-{nxx_str}")
+            
+            total_fetched += len(data)
+            
+            if DEBUG_MODE:
+                print(f"  DEBUG: Fetched {len(data)} records, total so far: {total_fetched}, unique NXX: {len(nxx_combinations)}")
+            
+            if len(data) < limit:
+                if DEBUG_MODE:
+                    print(f"  DEBUG: Last page reached for NPA {npa} (got {len(data)} < {limit})")
+                break
+                
+            offset += limit
+            
+        except Exception as e:
+            print(f"\n  ERROR: Unexpected error fetching NXX for NPA {npa}: {e}", file=sys.stderr)
+            break
+    
+    if DEBUG_MODE:
+        print(f"  DEBUG: Completed NPA {npa} - found {len(nxx_combinations)} unique NXX combinations")
+    
+    return nxx_combinations
+
+def fetch_blocks_for_npa_nxx(npa, nxx):
+    """Fetch all block_id values for a specific NPA-NXX combination (Step 2)"""
+    blocks = {'numeric': set(), 'has_a': False}
+    offset = 0
+    limit = 1000
+    
+    while True:
+        url = f"https://api-dev.ringer.tel/v1/telique/lerg/lerg_6/npa,nxx,block_id/npa={npa}&nxx={nxx}?limit={limit}&offset={offset}"
+        
+        try:
+            response_data = make_api_request_with_retry(url, headers={'x-api-token': API_TOKEN})
+            
+            if response_data is None:
+                print(f"\n  ERROR: Failed to fetch blocks for NPA {npa}-NXX {nxx} at offset {offset}", file=sys.stderr)
+                break
+            
+            data = response_data.get('data', [])
+            
+            if not data or len(data) == 0:
+                break
+                
+            for record in data:
+                block_id_val = str(record.get('block_id', ''))
+                
+                if block_id_val:
                     if block_id_val == 'A':
-                        # Mark this NPA-NXX as having an 'A' record
-                        npa_nxx_blocks[npa_nxx_key]['has_a'] = True
+                        blocks['has_a'] = True
                     else:
-                        # This is a numeric block that is explicitly assigned
-                        npa_nxx_blocks[npa_nxx_key]['numeric'].add(block_id_val)
-                        assigned.append(f"{npa_str}-{nxx_str}-{block_id_val}")
+                        blocks['numeric'].add(block_id_val)
             
             if len(data) < limit:
                 break
                 
             offset += limit
             
-        except urllib.error.URLError as e:
-            print(f"Error fetching NPA {npa} at offset {offset}: {e}", file=sys.stderr)
-            break
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON for NPA {npa}: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"\n  ERROR: Unexpected error fetching blocks for NPA {npa}-NXX {nxx}: {e}", file=sys.stderr)
             break
     
-    # Process NPA-NXX combinations with A block handling
-    # If an NPA-NXX has ONLY an A block and NO numeric blocks, all blocks 0-9 are considered assigned
+    return blocks
+
+def fetch_assigned_for_npa(npa):
+    """Fetch all assigned NPA-NXX-block_id combinations for a given NPA using two-step approach"""
+    assigned = []
+    
+    # Step 1: Get all NXX combinations for this NPA
+    if DEBUG_MODE:
+        print(f"  DEBUG: NPA {npa} - Step 1: Fetching NXX combinations...")
+    
+    nxx_combinations = fetch_nxx_combinations_for_npa(npa)
+    
+    if DEBUG_MODE:
+        print(f"  DEBUG: NPA {npa} - Step 1: Found {len(nxx_combinations)} NXX combinations")
+    
+    # Step 2: For each NPA-NXX, get all blocks
+    npa_nxx_blocks = {}
+    
+    if DEBUG_MODE:
+        print(f"  DEBUG: NPA {npa} - Step 2: Fetching blocks for {len(nxx_combinations)} NXX combinations...")
+    
+    for i, npa_nxx in enumerate(sorted(nxx_combinations), 1):
+        npa_part, nxx_part = npa_nxx.split('-')
+        
+        if DEBUG_MODE:
+            if i <= 5 or i % 10 == 0 or i == len(nxx_combinations):  # Show progress periodically
+                print(f"  DEBUG: NPA {npa} - Step 2: Progress {i}/{len(nxx_combinations)} - Fetching blocks for {npa_nxx}")
+        
+        blocks = fetch_blocks_for_npa_nxx(npa_part, nxx_part)
+        npa_nxx_blocks[npa_nxx] = blocks
+        
+        # Add numeric blocks to assigned list
+        for block_id in blocks['numeric']:
+            assigned.append(f"{npa_nxx}-{block_id}")
+        
+        # Progress indicator for non-debug mode
+        if not DEBUG_MODE and i % 50 == 0:
+            print(f"    Progress: {i}/{len(nxx_combinations)} NXX processed for NPA {npa}")
+    
+    # Process A-block handling (unchanged logic)
     a_only_count = 0
     for npa_nxx_key, block_info in npa_nxx_blocks.items():
         if block_info['has_a'] and len(block_info['numeric']) == 0:
@@ -140,7 +308,6 @@ def fetch_assigned_for_npa(npa):
                 assigned.append(f"{npa_nxx_key}-{block}")
     
     if DEBUG_MODE:
-        print(f"  DEBUG: NPA {npa} - Found {duplicate_count} duplicate records")
         print(f"  DEBUG: NPA {npa} - Found {a_only_count} NPA-NXX with A-only blocks")
         print(f"  DEBUG: NPA {npa} - Total assigned: {len(assigned)}")
     
@@ -347,6 +514,13 @@ def main(args=None):
         print("DEBUG MODE ENABLED (set DNO_DEBUG=false to disable)")
         print("=" * 50)
     
+    # Show rate limiting status
+    rate_limit_enabled = os.environ.get('DNO_RATE_LIMIT', '').lower() in ('true', '1', 'yes')
+    if rate_limit_enabled:
+        print("Rate limiting: ENABLED (set DNO_RATE_LIMIT=false to disable)")
+    elif DEBUG_MODE:
+        print("Rate limiting: DISABLED (running at maximum speed)")
+    
     print("Generating all possible NPA codes...")
     all_npas = generate_all_possible_npa()
     print(f"Total NPAs to query: {len(all_npas)}")
@@ -355,30 +529,49 @@ def main(args=None):
     all_assigned = set()
     all_npa_nxx_blocks = {}
     
+    start_time = time.time()
+    
     for i, npa in enumerate(all_npas, 1):
+        npa_start_time = time.time()
+        
         if DEBUG_MODE:
-            print(f"\nProcessing NPA {npa} ({i}/{len(all_npas)})...")
+            print(f"\n{'='*60}")
+            print(f"Processing NPA {npa} ({i}/{len(all_npas)})...")
+            print(f"Elapsed time: {(time.time() - start_time):.1f}s")
         else:
-            print(f"Processing NPA {npa} ({i}/{len(all_npas)})...", end='\r')
+            # More informative progress for non-debug mode
+            elapsed = time.time() - start_time
+            if i > 1:
+                avg_time = elapsed / (i - 1)
+                eta = avg_time * (len(all_npas) - i)
+                print(f"Processing NPA {npa} ({i}/{len(all_npas)}) - Elapsed: {elapsed:.0f}s, ETA: {eta:.0f}s", end='\r')
+            else:
+                print(f"Processing NPA {npa} ({i}/{len(all_npas)})...", end='\r')
         
-        assigned_for_npa, npa_nxx_blocks = fetch_assigned_for_npa(npa)
-        
-        # Track progress
-        size_before = len(all_assigned)
-        
-        all_assigned.update(assigned_for_npa)
-        size_after = len(all_assigned)
-        
-        if DEBUG_MODE:
-            new_unique = size_after - size_before
-            duplicates = len(assigned_for_npa) - new_unique
-            print(f"  DEBUG: Added {new_unique} unique entries ({duplicates} duplicates across NPAs)")
-        
-        all_npa_nxx_blocks.update(npa_nxx_blocks)
-        
-        # Small delay to be respectful to the API
-        if i % 10 == 0:
-            time.sleep(0.5)
+        try:
+            assigned_for_npa, npa_nxx_blocks = fetch_assigned_for_npa(npa)
+            
+            # Track progress
+            size_before = len(all_assigned)
+            
+            all_assigned.update(assigned_for_npa)
+            size_after = len(all_assigned)
+            
+            npa_elapsed = time.time() - npa_start_time
+            
+            if DEBUG_MODE:
+                new_unique = size_after - size_before
+                duplicates = len(assigned_for_npa) - new_unique
+                print(f"  DEBUG: NPA {npa} completed in {npa_elapsed:.1f}s")
+                print(f"  DEBUG: Added {new_unique} unique entries ({duplicates} duplicates across NPAs)")
+                print(f"  DEBUG: Total assigned so far: {len(all_assigned)}")
+            
+            all_npa_nxx_blocks.update(npa_nxx_blocks)
+            
+        except Exception as e:
+            print(f"\nERROR: Failed to process NPA {npa}: {e}", file=sys.stderr)
+            print(f"Continuing with next NPA...", file=sys.stderr)
+            continue
     
     print(f"\n\nTotal assigned NPA-NXX-X combinations found: {len(all_assigned)}")
     
@@ -405,15 +598,15 @@ def main(args=None):
     print("\nWriting results to CSV files...")
     
     # Write assigned combinations
-    with open('/tmp/assigned_npa_nxx_x.csv', 'w', newline='') as f:
+    with open('assigned_npa_nxx_x.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['NPA-NXX-X', 'Status'])
         for combo in sorted(all_assigned):
             writer.writerow([combo, 'Assigned'])
-    print(f"Assigned combinations written to: /tmp/assigned_npa_nxx_x.csv")
+    print(f"Assigned combinations written to: assigned_npa_nxx_x.csv")
     
     # Write diagnostic info about A blocks
-    with open('/tmp/a_block_analysis.csv', 'w', newline='') as f:
+    with open('a_block_analysis.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['NPA-NXX', 'Has_A_Block', 'Numeric_Blocks_Explicitly_Listed', 'Status'])
         for npa_nxx_key, block_info in sorted(all_npa_nxx_blocks.items()):
@@ -429,14 +622,14 @@ def main(args=None):
                     ','.join(assigned_nums) if assigned_nums else 'None',
                     status
                 ])
-    print(f"A block analysis written to: /tmp/a_block_analysis.csv")
+    print(f"A block analysis written to: a_block_analysis.csv")
     
     # Fetch ITG traceback data
     print("\nFetching ITG traceback data from BigQuery...")
     itg_data = fetch_itg_traceback_data()
     
     # Write combined unassigned combinations
-    with open('/tmp/unassigned_npa_nxx_x.csv', 'w', newline='') as f:
+    with open('unassigned_npa_nxx_x.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         # No header line - upload endpoint expects no headers
         current_datestamp = datetime.now(timezone.utc).isoformat()
@@ -467,7 +660,7 @@ def main(args=None):
                 invalid_records.append(('ITG', digits, len(digits)))
     
     total_records = len(condensed_unassigned) + len(itg_data)
-    print(f"Combined unassigned data written to: /tmp/unassigned_npa_nxx_x.csv")
+    print(f"Combined unassigned data written to: unassigned_npa_nxx_x.csv")
     print(f"  - LERG Unassigned: {len(condensed_unassigned)} entries")
     print(f"  - ITG Traceback: {len(itg_data)} entries")
     print(f"  - Valid records written: {valid_records}")
@@ -483,7 +676,7 @@ def main(args=None):
     print(f"  - Total: {valid_records} valid entries (out of {total_records} total)")
     
     # Write summary
-    with open('/tmp/lerg_summary.csv', 'w', newline='') as f:
+    with open('lerg_summary.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Category', 'Count', 'Percentage'])
         writer.writerow(['Total Theoretically Possible', len(all_possible), '100.00%'])
@@ -491,7 +684,7 @@ def main(args=None):
         writer.writerow(['Unassigned', len(unassigned), f'{(len(unassigned)/len(all_possible)*100):.2f}%'])
         writer.writerow(['NPA-NXX with A-only (all blocks assigned)', npa_nxx_with_a_only, '-'])
         writer.writerow(['Condensed Unassigned Entries', len(condensed_unassigned), f'{(len(condensed_unassigned)/len(unassigned)*100) if unassigned else 0:.2f}% of original'])
-    print(f"Summary written to: /tmp/lerg_summary.csv")
+    print(f"Summary written to: lerg_summary.csv")
     
     print("\n" + "="*50)
     print("SUMMARY")
@@ -506,7 +699,7 @@ def main(args=None):
     
     # Handle automatic upload if requested
     if args and args.upload:
-        unassigned_file = '/tmp/unassigned_npa_nxx_x.csv'
+        unassigned_file = 'unassigned_npa_nxx_x.csv'
         print("\n" + "="*50)
         print("UPLOAD TO API")
         print("="*50)

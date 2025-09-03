@@ -145,3 +145,9 @@ cython_debug/
 
 # macOS
 .DS_Store
+
+# Generated CSV files
+assigned_npa_nxx_x.csv
+a_block_analysis.csv
+unassigned_npa_nxx_x.csv
+lerg_summary.csv
