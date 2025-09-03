@@ -17,8 +17,24 @@ import socket
 # Load environment variables from .env file
 load_dotenv()
 
+# SendGrid imports (optional - will work without if not installed)
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail, Content, From, To
+    SENDGRID_AVAILABLE = True
+except ImportError:
+    SENDGRID_AVAILABLE = False
+    print("Note: SendGrid not installed. Email notifications will be skipped.")
+    print("      Install with: pip install sendgrid")
+
 API_TOKEN = os.environ.get('API_TOKEN')
 API_BASE_URL = 'https://api-dev.ringer.tel/v1/telique/lerg/lerg_6'
+
+# SendGrid configuration
+SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY')
+SENDGRID_FROM_EMAIL = os.environ.get('SENDGRID_FROM_EMAIL', 'dno-generator@teliax.com')
+SENDGRID_TO_EMAIL = os.environ.get('SENDGRID_TO_EMAIL', 'engineering@teliax.com')
+ENABLE_EMAIL_NOTIFICATIONS = os.environ.get('DNO_EMAIL_NOTIFICATIONS', 'true').lower() in ('true', '1', 'yes')
 
 # Enable debug logging with environment variable
 DEBUG_MODE = os.environ.get('DNO_DEBUG', '').lower() in ('true', '1', 'yes')
@@ -521,6 +537,170 @@ def upload_to_api(file_path, api_url="https://api-dev.ringer.tel/v1/telique/admi
         print(f"✗ Upload error: {e}")
         return False
 
+def send_email_notification(subject, html_content, text_content=None):
+    """
+    Send email notification using SendGrid
+    
+    Args:
+        subject: Email subject
+        html_content: HTML content of the email
+        text_content: Plain text content (optional, will be derived from HTML if not provided)
+    
+    Returns:
+        bool: True if email sent successfully, False otherwise
+    """
+    if not ENABLE_EMAIL_NOTIFICATIONS:
+        if DEBUG_MODE:
+            print("Email notifications disabled (DNO_EMAIL_NOTIFICATIONS=false)")
+        return False
+    
+    if not SENDGRID_AVAILABLE:
+        if DEBUG_MODE:
+            print("SendGrid not available - skipping email notification")
+        return False
+    
+    if not SENDGRID_API_KEY:
+        print("Warning: SENDGRID_API_KEY not found in environment - skipping email notification")
+        return False
+    
+    try:
+        sg = SendGridAPIClient(api_key=SENDGRID_API_KEY)
+        
+        # Create email
+        from_email = From(SENDGRID_FROM_EMAIL)
+        to_email = To(SENDGRID_TO_EMAIL)
+        
+        # If text content not provided, create simple version
+        if text_content is None:
+            text_content = html_content.replace('<br>', '\n').replace('<b>', '').replace('</b>', '')
+            # Remove HTML tags
+            import re
+            text_content = re.sub('<[^<]+?>', '', text_content)
+        
+        mail = Mail(
+            from_email=from_email,
+            to_emails=to_email,
+            subject=subject,
+            plain_text_content=text_content,
+            html_content=html_content
+        )
+        
+        # Send email
+        response = sg.send(mail)
+        
+        if response.status_code == 202:
+            print(f"✓ Email notification sent to {SENDGRID_TO_EMAIL}")
+            return True
+        else:
+            print(f"Warning: Email send returned status {response.status_code}")
+            return False
+            
+    except Exception as e:
+        error_msg = str(e)
+        if "401" in error_msg or "Unauthorized" in error_msg:
+            print(f"Warning: SendGrid API authentication failed. Please verify your API key.")
+            print(f"  Current key starts with: {SENDGRID_API_KEY[:10]}..." if SENDGRID_API_KEY else "  No key found")
+        elif "403" in error_msg:
+            print(f"Warning: SendGrid API forbidden. Check sender email permissions.")
+        else:
+            print(f"Warning: Failed to send email notification: {e}")
+        if DEBUG_MODE:
+            print(f"  From: {SENDGRID_FROM_EMAIL}")
+            print(f"  To: {SENDGRID_TO_EMAIL}")
+        return False
+
+def send_success_email(stats):
+    """
+    Send success email with DNO generation statistics
+    
+    Args:
+        stats: Dictionary containing run statistics
+    """
+    runtime = stats.get('runtime', 0)
+    runtime_str = f"{runtime/60:.1f} minutes" if runtime > 60 else f"{runtime:.0f} seconds"
+    
+    subject = f"✅ DNO Generation Completed - {stats.get('total_assigned', 0):,} Assigned"
+    
+    html_content = f"""
+    <h2>DNO Generation Completed Successfully</h2>
+    
+    <h3>Summary</h3>
+    <ul>
+        <li><b>Runtime:</b> {runtime_str}</li>
+        <li><b>NPAs Processed:</b> {stats.get('npas_processed', 0)}</li>
+        <li><b>API Calls Made:</b> {stats.get('api_calls', 'N/A')}</li>
+        <li><b>Fetch Mode:</b> {stats.get('fetch_mode', 'BULK')}</li>
+    </ul>
+    
+    <h3>Results</h3>
+    <ul>
+        <li><b>Total Theoretically Possible:</b> {stats.get('total_possible', 0):,}</li>
+        <li><b>Currently Assigned (LERG):</b> {stats.get('total_assigned', 0):,} ({stats.get('assigned_percent', 0):.2f}%)</li>
+        <li><b>Currently Unassigned:</b> {stats.get('total_unassigned', 0):,} ({stats.get('unassigned_percent', 0):.2f}%)</li>
+        <li><b>Condensed Unassigned Entries:</b> {stats.get('condensed_unassigned', 0):,}</li>
+        <li><b>ITG Traceback Records:</b> {stats.get('itg_records', 0):,}</li>
+    </ul>
+    
+    <h3>Output Files Generated</h3>
+    <ul>
+        <li>assigned_npa_nxx_x.csv - {stats.get('total_assigned', 0):,} records</li>
+        <li>unassigned_npa_nxx_x.csv - {stats.get('total_output_records', 0):,} records</li>
+        <li>a_block_analysis.csv</li>
+        <li>lerg_summary.csv</li>
+    </ul>
+    
+    <p><small>Generated at {datetime.now(timezone.utc).isoformat()}</small></p>
+    """
+    
+    send_email_notification(subject, html_content)
+
+def send_failure_email(npa, error_message, stats=None):
+    """
+    Send failure email with error details
+    
+    Args:
+        npa: The NPA that failed
+        error_message: The error message
+        stats: Optional statistics dictionary for partial progress
+    """
+    subject = f"❌ DNO Generation Failed at NPA {npa}"
+    
+    progress = ""
+    if stats:
+        progress = f"""
+        <h3>Progress Before Failure</h3>
+        <ul>
+            <li><b>NPAs Processed:</b> {stats.get('npas_processed', 0)} of {stats.get('total_npas', 800)}</li>
+            <li><b>Elapsed Time:</b> {stats.get('runtime', 0):.1f} seconds</li>
+            <li><b>Records Collected:</b> {stats.get('records_collected', 0):,}</li>
+        </ul>
+        """
+    
+    html_content = f"""
+    <h2>DNO Generation Failed</h2>
+    
+    <h3>Error Details</h3>
+    <ul>
+        <li><b>Failed NPA:</b> {npa}</li>
+        <li><b>Error:</b> {error_message}</li>
+        <li><b>Time of Failure:</b> {datetime.now(timezone.utc).isoformat()}</li>
+    </ul>
+    
+    {progress}
+    
+    <h3>Next Steps</h3>
+    <ol>
+        <li>Check network connectivity</li>
+        <li>Verify API is responding</li>
+        <li>Review error logs</li>
+        <li>Re-run the script: <code>python dno_gen.py</code></li>
+    </ol>
+    
+    <p><small>Data integrity check prevented incomplete data from being written.</small></p>
+    """
+    
+    send_email_notification(subject, html_content)
+
 def condense_unassigned(unassigned_set):
     """
     Condense unassigned combinations to lowest common denominator.
@@ -676,6 +856,16 @@ def main(args=None):
             print(f"Data integrity cannot be guaranteed with missing NPAs.", file=sys.stderr)
             print(f"Please fix the issue and re-run the script.", file=sys.stderr)
             print(f"\nTo resume from NPA {npa}, you can modify the script to start from this NPA.", file=sys.stderr)
+            
+            # Send failure email
+            failure_stats = {
+                'npas_processed': i - 1,
+                'total_npas': len(all_npas),
+                'runtime': time.time() - start_time,
+                'records_collected': len(all_assigned)
+            }
+            send_failure_email(npa, str(e), failure_stats)
+            
             sys.exit(1)
     
     print(f"\n\nTotal assigned NPA-NXX-X combinations found: {len(all_assigned)}")
@@ -801,6 +991,23 @@ def main(args=None):
     print(f"Condensed LERG Unassigned:        {len(condensed_unassigned):,} ({(1 - len(condensed_unassigned)/len(unassigned))*100 if unassigned else 0:.2f}% reduction)")
     if 'itg_data' in locals():
         print(f"ITG Traceback Records:            {len(itg_data):,}")
+    
+    # Send success email
+    success_stats = {
+        'runtime': time.time() - start_time,
+        'npas_processed': len(all_npas),
+        'api_calls': 'N/A',  # Would need to track this globally
+        'fetch_mode': 'BULK' if USE_BULK_FETCH else 'LEGACY',
+        'total_possible': len(all_possible),
+        'total_assigned': len(all_assigned),
+        'assigned_percent': (len(all_assigned)/len(all_possible)*100),
+        'total_unassigned': len(unassigned),
+        'unassigned_percent': (len(unassigned)/len(all_possible)*100),
+        'condensed_unassigned': len(condensed_unassigned),
+        'itg_records': len(itg_data) if 'itg_data' in locals() else 0,
+        'total_output_records': valid_records if 'valid_records' in locals() else len(condensed_unassigned)
+    }
+    send_success_email(success_stats)
     
     # Handle automatic upload if requested
     if args and args.upload:
